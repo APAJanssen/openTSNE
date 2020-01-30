@@ -12,6 +12,12 @@ from openTSNE import initialization as initialization_scheme
 from openTSNE.affinity import Affinities, PerplexityBasedNN
 from openTSNE.quad_tree import QuadTree
 
+try: 
+    import tsnecuda
+    tsnecuda_enabled = True
+except ImportError:
+    tsnecuda_enabled = False
+
 EPSILON = np.finfo(np.float64).eps
 
 log = logging.getLogger(__name__)
@@ -989,6 +995,8 @@ class TSNE(BaseEstimator):
         callbacks=None,
         callbacks_every_iters=50,
         random_state=None,
+        #Added for cuda support
+        gpu=False
     ):
         self.n_components = n_components
         self.perplexity = perplexity
@@ -1021,6 +1029,13 @@ class TSNE(BaseEstimator):
         self.callbacks_every_iters = callbacks_every_iters
 
         self.random_state = random_state
+        #Added for cuda
+        if tsnecuda_enabled and gpu:
+            self.gpu = gpu
+        else:
+            if gpu: 
+                print("To use gpu acceleration tsnecuda is required. Please install (or fix) the tsnecuda module.")
+            self.gpu = false
 
     def fit(self, X):
         """Fit a t-SNE embedding for a given data set.
@@ -1039,35 +1054,132 @@ class TSNE(BaseEstimator):
             A fully optimized t-SNE embedding.
 
         """
-        embedding = self.prepare_initial(X)
+        #Added for cuda!
+        if self.gpu==True:
+            print("I should use the cpu, but I hope I have to learnt how")
+            embedding = self.tsnecuda_to_embedding(X)
+            
+        else:
+        #end additions
+            embedding = self.prepare_initial(X)
 
-        try:
-            # Early exaggeration with lower momentum to allow points to find more
-            # easily move around and find their neighbors
-            embedding.optimize(
-                n_iter=self.early_exaggeration_iter,
-                exaggeration=self.early_exaggeration,
-                momentum=self.initial_momentum,
-                inplace=True,
-                propagate_exception=True,
-            )
+            try:
+                # Early exaggeration with lower momentum to allow points to find more
+                # easily move around and find their neighbors
+                embedding.optimize(
+                    n_iter=self.early_exaggeration_iter,
+                    exaggeration=self.early_exaggeration,
+                    momentum=self.initial_momentum,
+                    inplace=True,
+                    propagate_exception=True,
+                )
 
-            # Restore actual affinity probabilities and increase momentum to get
-            # final, optimized embedding
-            embedding.optimize(
-                n_iter=self.n_iter,
-                exaggeration=self.exaggeration,
-                momentum=self.final_momentum,
-                inplace=True,
-                propagate_exception=True,
-            )
+                # Restore actual affinity probabilities and increase momentum to get
+                # final, optimized embedding
+                embedding.optimize(
+                    n_iter=self.n_iter,
+                    exaggeration=self.exaggeration,
+                    momentum=self.final_momentum,
+                    inplace=True,
+                    propagate_exception=True,
+                )
 
-        except OptimizationInterrupt as ex:
-            log.info("Optimization was interrupted with callback.")
-            embedding = ex.final_embedding
+            except OptimizationInterrupt as ex:
+                log.info("Optimization was interrupted with callback.")
+                embedding = ex.final_embedding
 
         return embedding
 
+    def tsnecuda_to_embedding(self, X):
+        """Transform the 2D embedding from tsnecuda to openTSNE 
+        :class:'TSNEEmbedding' object
+
+        Parameters
+        ----------
+        cudaembedding: np.ndarray
+            The data matrix to be transformed to TSNEEmbedding.
+
+        Returns
+        -------
+        TSNEEmbedding
+            A botched :class:`TSNEEmbedding` object.
+
+        """
+        embedding = tsnecuda.TSNE(
+                n_components = self.n_components,
+                perplexity = self.perplexity,
+                early_exaggeration = self.early_exaggeration,
+                learning_rate = self.learning_rate,
+                num_neighbors = 25, #openTSNE uses a k of 25 but doesn't expose this value
+                force_magnify_iters = self.early_exaggeration_iter,
+                pre_momentum = self.initial_momentum,
+                post_momentum = self.final_momentum,
+                theta = self.theta,
+                epssq = 0.0025,
+                n_iter = self.n_iter,
+                n_iter_without_progress = 1000,
+                min_grad_norm = self.min_grad_norm,
+                perplexity_epsilon = 1e-3,
+                metric = self.metric, #will fail for everything other than 'euclidian'
+                init ='random',
+                return_style ='once',
+                num_snapshots = 5,
+                verbose = 0,
+                random_seed = None,
+                use_interactive = False,
+                viz_timeout = 10000,
+                viz_server = "tcp://localhost:5556",
+                dump_points = False,
+                dump_file = "dump.txt",
+                dump_interval = 1,
+                print_interval = self.callbacks_every_iters,
+                device = 0,
+                magnitude_factor = 5
+            ).fit_transform(X)
+
+        affinities = PerplexityBasedNN(
+            X,
+            self.perplexity,
+            method=self.neighbors_method,
+            metric=self.metric,
+            metric_params=self.metric_params,
+            n_jobs=self.n_jobs,
+            random_state=self.random_state,
+        )
+
+        gradient_descent_params = {
+            # Degrees of freedom of the Student's t-distribution. The
+            # suggestion degrees_of_freedom = n_components - 1 comes from [3]_.
+            "dof":  max(self.n_components - 1, 1),
+
+            "negative_gradient_method": self.negative_gradient_method,
+            "learning_rate": self.learning_rate,
+            # By default, use the momentum used in unexaggerated phase
+            "momentum": self.final_momentum,
+
+            # Barnes-Hut params
+            "theta": self.theta,
+            # Interpolation params
+            "n_interpolation_points": self.n_interpolation_points,
+            "min_num_intervals": self.min_num_intervals,
+            "ints_in_interval": self.ints_in_interval,
+
+            "min_grad_norm": self.min_grad_norm,
+            "max_grad_norm": self.max_grad_norm,
+
+            "n_jobs": self.n_jobs,
+            # Callback params
+            "callbacks": self.callbacks,
+            "callbacks_every_iters": self.callbacks_every_iters,
+        }
+
+        return TSNEEmbedding(
+            embedding,
+            affinities=affinities,
+            random_state=self.random_state,
+            **gradient_descent_params,
+        )
+    
     def prepare_initial(self, X):
         """Prepare the initial embedding which can be optimized as needed.
 
@@ -1107,7 +1219,7 @@ class TSNE(BaseEstimator):
             )
         else:
             raise ValueError(
-                f"Unrecognized initialization scheme `{self.initialization}`."
+                f"Unrecognized initialization scheme `{self.initialization}`"
             )
 
         affinities = PerplexityBasedNN(
